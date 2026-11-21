@@ -24,6 +24,7 @@ jobs:
     timeout-minutes: 355
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: rizkimuhamad123sdmyy-hash/runova-images
       VER: ${{ inputs.version }}
       TAG: ${{ inputs.tag }}
     steps:
