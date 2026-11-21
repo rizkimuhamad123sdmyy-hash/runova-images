@@ -1,0 +1,187 @@
+name: Bikin image Windows
+run-name: Bikin image Windows ${{ inputs.version }} (${{ inputs.tag }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versi Dockur (VERSION): 11, 11l, dst. Cek README dockur/windows'
+        required: true
+        default: '11'
+        type: string
+      tag:
+        description: 'Nama rilis tempat image disimpan'
+        required: true
+        default: 'win11-v1'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VER: ${{ inputs.version }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Validasi input
+        run: |
+          [[ "$VER" =~ ^[A-Za-z0-9._-]{1,20}$ ]] || { echo "::error::version tidak valid"; exit 1; }
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]{1,40}$ ]] || { echo "::error::tag tidak valid"; exit 1; }
+
+      - name: Siapkan KVM dan ruang disk
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::KVM tidak tersedia di runner ini. Image tidak bisa dibuat."
+            exit 1
+          fi
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          command -v zstd >/dev/null || { sudo apt-get update -y && sudo apt-get install -y zstd; }
+          df -h / /mnt
+
+      - name: Siapkan folder dan skrip OEM
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /var/win /var/shared /var/oem /mnt/out
+          sudo chmod 777 /var/win /var/shared /var/oem /mnt/out
+          # install.bat dijalankan Dockur di akhir instalasi: memasang tugas yang mengatur password saat Windows menyala.
+          cat > /var/oem/install.bat <<'BAT'
+          @echo off
+          schtasks /create /tn RunovaInit /tr "cmd /c C:\OEM\runova-init.cmd" /sc onstart /ru SYSTEM /rl highest /f
+          schtasks /run /tn RunovaInit
+          BAT
+          # runova-init.cmd menunggu username dan password dari folder bersama, mengaturnya, lalu mematikan akun build.
+          cat > /var/oem/runova-init.cmd <<'BAT'
+          @echo off
+          set D=\\host.lan\Data
+          :wait
+          if exist "%D%\runova-pass.txt" if exist "%D%\runova-user.txt" goto go
+          ping -n 6 127.0.0.1 >nul
+          goto wait
+          :go
+          ping -n 3 127.0.0.1 >nul
+          set /p RU=<"%D%\runova-user.txt"
+          set /p RP=<"%D%\runova-pass.txt"
+          net user "%RU%" >nul 2>&1
+          if errorlevel 1 goto add
+          net user "%RU%" "%RP%"
+          goto fin
+          :add
+          net user "%RU%" "%RP%" /add /y
+          net localgroup Administrators "%RU%" /add
+          net localgroup "Remote Desktop Users" "%RU%" /add
+          :fin
+          if /i not "%RU%"=="builder" net user builder /active:no
+          del /q "%D%\runova-pass.txt" "%D%\runova-user.txt"
+          echo ok> "%D%\runova-done.txt"
+          BAT
+          sed -i 's/$/\r/' /var/oem/install.bat /var/oem/runova-init.cmd
+
+      - name: Menjalankan Windows (instal pertama)
+        run: |
+          set -euo pipefail
+          RAM=$(awk '/MemTotal/ {printf "%d", ($2/1048576)-2}' /proc/meminfo)
+          if [ "$RAM" -lt 3 ]; then RAM=3; fi
+          CORES=$(nproc)
+          BPW=$(openssl rand -hex 12)
+          echo "::add-mask::$BPW"
+          echo "Windows $VER: ${CORES} core, ${RAM}G RAM"
+          docker run -d --name win --stop-timeout 300 \
+            --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN \
+            -e VERSION="$VER" -e RAM_SIZE="${RAM}G" -e CPU_CORES="$CORES" -e DISK_SIZE=64G \
+            -e USERNAME=builder -e PASSWORD="$BPW" \
+            -v /var/win:/storage -v /var/shared:/shared -v /var/oem:/oem \
+            -p 3389:3389/tcp -p 3389:3389/udp \
+            dockurr/windows >/dev/null
+          cat > /tmp/rdpprobe.py <<'PY'
+          import socket, sys
+          s = socket.socket(); s.settimeout(5)
+          try:
+              s.connect(('127.0.0.1', 3389))
+              s.sendall(bytes.fromhex('030000130ee000000000000100080003000000'))
+              sys.exit(0 if s.recv(4)[:2] == b'\x03\x00' else 1)
+          except Exception:
+              sys.exit(1)
+          PY
+          ready=0
+          for i in $(seq 1 330); do
+            if python3 /tmp/rdpprobe.py; then ready=1; break; fi
+            if [ -z "$(docker ps -q -f name=win)" ]; then
+              echo "::error::Kontainer Windows berhenti sebelum siap."
+              docker logs --tail 60 win || true
+              exit 1
+            fi
+            sleep 10
+          done
+          if [ "$ready" != "1" ]; then
+            echo "::error::Windows belum siap setelah 55 menit."
+            docker logs --tail 60 win || true
+            exit 1
+          fi
+          echo "Windows menjawab RDP. Menunggu 3 menit supaya setup awal tenang."
+          sleep 180
+
+      - name: Uji pengaturan password (wajib berhasil)
+        run: |
+          set -euo pipefail
+          # Image hanya boleh dibagikan kalau password bisa diganti dari luar. Kalau tidak, akun build akan ikut terpublikasi.
+          TP=$(openssl rand -hex 12)
+          printf '%s' "$TP" > /var/shared/.p && mv /var/shared/.p /var/shared/runova-pass.txt
+          printf '%s' runova > /var/shared/.u && mv /var/shared/.u /var/shared/runova-user.txt
+          chmod 666 /var/shared/runova-*.txt
+          ok=0
+          for i in $(seq 1 120); do
+            if [ -f /var/shared/runova-done.txt ]; then ok=1; break; fi
+            sleep 5
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::Windows tidak membalas pengaturan password (folder bersama \\\\host.lan\\Data tidak terbaca atau tugas OEM tidak terpasang). Image TIDAK diupload."
+            docker logs --tail 60 win || true
+            ls -la /var/shared || true
+            exit 1
+          fi
+          echo "Pengaturan password dari luar berhasil."
+          rm -f /var/shared/runova-*.txt
+
+      - name: Matikan Windows dengan rapi
+        run: |
+          set -euo pipefail
+          docker stop -t 300 win >/dev/null
+          if [ -n "$(docker ps -q -f name=win)" ]; then echo "::error::Windows belum mati."; exit 1; fi
+          sudo ls -la /var/win
+          sudo du -sh /var/win
+
+      - name: Kompres dan pecah
+        run: |
+          set -euo pipefail
+          cd /var/win
+          # ISO dibuang; disk data.img sparse, jadi tar -S supaya ruang kosong tidak ikut.
+          sudo tar --exclude='*.iso' -S -cf - . | zstd -q -T0 -3 | split -b 1900M -d -a 3 - /mnt/out/win.tar.zst.part
+          cd /mnt/out
+          sha256sum win.tar.zst.part* > SHA256SUMS
+          N=$(ls win.tar.zst.part* | wc -l)
+          printf '{"version":"%s","tag":"%s","parts":%s,"built":"%s"}\n' "$VER" "$TAG" "$N" "$(date -u +%FT%TZ)" > manifest.json
+          ls -la /mnt/out
+          df -h /mnt
+
+      - name: Upload ke Releases
+        run: |
+          set -euo pipefail
+          gh release delete "$TAG" --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release create "$TAG" --title "Windows image $VER" --notes "Image Windows $VER terinstal, dipecah per 1,9 GB. Gabung: cat win.tar.zst.part* | zstd -d | tar -xS -C /var/win"
+          for f in /mnt/out/*; do
+            ok=0
+            for i in 1 2 3; do
+              if gh release upload "$TAG" "$f" --clobber; then ok=1; break; fi
+              sleep 15
+            done
+            if [ "$ok" != "1" ]; then echo "::error::Gagal upload $(basename "$f")"; exit 1; fi
+          done
+          echo "Selesai. Alamat: https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/"
